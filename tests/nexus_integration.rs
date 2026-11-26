@@ -846,3 +846,143 @@ async fn axum_http_api_end_to_end_covers_all_endpoints_and_guardrails() {
     assert_eq!(rgbl_json["epistemic_layers"][2]["label"], "Balance");
     assert_ne!(crayon_json["profile_id"], rgbl_json["profile_id"]);
 }
+
+#[tokio::test]
+async fn mtime_api_converts_timestamps_and_never_claims_religious_authority() {
+    let store = NexusGraphStore::open_in_memory().expect("in-memory store");
+    let router = build_router(AppState::new(store));
+
+    let (j2000_status, j2000_json) = send_json_request(
+        &router,
+        Method::GET,
+        "/api/time/convert?ts=2000-01-01T12:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(j2000_status, StatusCode::OK);
+    assert_eq!(j2000_json["profile"], "antikythera-mtime-v1");
+    assert_eq!(j2000_json["religious_authority"], false);
+    assert_eq!(j2000_json["unix_timestamp"], 946_728_000);
+    let jd = j2000_json["julian_day"].as_f64().expect("julian_day float");
+    assert!((jd - 2_451_545.0).abs() < 1e-6);
+    assert!(j2000_json["hijri_tabular"]["year"].as_i64().is_some());
+    assert!(j2000_json["solar_longitude_deg"].as_f64().is_some());
+
+    let (now_status, now_json) =
+        send_json_request(&router, Method::GET, "/api/time/convert?ts=now", None).await;
+    assert_eq!(now_status, StatusCode::OK);
+    assert_eq!(now_json["religious_authority"], false);
+    assert_eq!(now_json["profile"], "antikythera-mtime-v1");
+
+    let (bad_status, bad_json) = send_json_request(
+        &router,
+        Method::GET,
+        "/api/time/convert?ts=invalid-timestamp",
+        None,
+    )
+    .await;
+    assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_json["error_code"], "INVALID_TIMESTAMP");
+}
+
+#[tokio::test]
+async fn radar_ingest_persists_event_legend_preserves_uncertainty_and_links_domain_node() {
+    let store = NexusGraphStore::open_in_memory().expect("in-memory store");
+    // Seed a domain/source node so POST /api/radar/ingest can link a RELATIONSHIP_CORRELATION edge.
+    let domain_node = store
+        .create_node(CreateNodeRequest {
+            id: Some("domain-geopolitics".to_owned()),
+            domain: ProvenanceDomain::PerspectiveJizz,
+            canonical_label: "geopolitics".to_owned(),
+            corpus_ref: "mw-echo://domain/geopolitics".to_owned(),
+            uncertainty_state: Some(UncertaintyState::HumanReviewed),
+            alias_set: None,
+            sensitivity_class: None,
+            metadata: None,
+        })
+        .expect("seed domain node");
+
+    let router = build_router(AppState::new(store.clone()));
+
+    let (create_status, create_json) = send_json_request(
+        &router,
+        Method::POST,
+        "/api/radar/ingest",
+        Some(json!({
+            "eventId": "evt-radar-001",
+            "title": "Maritime corridor disruption reported",
+            "summary": "Initial multi-source radar cluster detected.",
+            "primaryDomain": "geopolitics",
+            "clusterKey": "cluster-maritime-01",
+            "sourceUri": "https://echo.moonwitness.org/radar/evt-radar-001",
+            "occurredAt": "2026-11-26T12:00:00Z",
+            "domains": ["geopolitics", "maritime"]
+        })),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+    assert_eq!(create_json["status"], "created");
+    assert_eq!(create_json["uncertainty_state_preserved"], true);
+    assert_eq!(create_json["event_node"]["id"], "radar-event-evt-radar-001");
+    assert_eq!(create_json["event_node"]["domain"], "EVENT_LEGEND");
+    assert_eq!(create_json["event_node"]["uncertainty_state"], "unknown");
+    assert_eq!(
+        create_json["event_node"]["corpus_ref"],
+        "https://echo.moonwitness.org/radar/evt-radar-001"
+    );
+    assert_eq!(
+        create_json["linked_target_node_id"],
+        domain_node.id.as_str()
+    );
+    assert_eq!(
+        create_json["correlation_edge"]["relation_kind"],
+        "correlated_with"
+    );
+    assert_eq!(create_json["correlation_edge"]["implies_causation"], false);
+    assert_eq!(create_json["correlation_edge"]["implies_identity"], false);
+
+    // Re-ingest with updated title & summary: must update without mutating corpus_ref or uncertainty_state.
+    let (update_status, update_json) = send_json_request(
+        &router,
+        Method::POST,
+        "/api/radar/ingest",
+        Some(json!({
+            "eventId": "evt-radar-001",
+            "title": "Maritime corridor disruption updated",
+            "summary": "Corroborated by second radar sweep.",
+            "primaryDomain": "geopolitics",
+            "clusterKey": "cluster-maritime-02",
+            "sourceUri": "https://echo.moonwitness.org/radar/different-uri-ignored-for-corpus-ref",
+            "occurredAt": "2026-11-26T12:30:00Z",
+            "domains": ["geopolitics"]
+        })),
+    )
+    .await;
+    assert_eq!(update_status, StatusCode::OK);
+    assert_eq!(update_json["status"], "updated");
+    assert_eq!(update_json["uncertainty_state_preserved"], true);
+    assert_eq!(
+        update_json["event_node"]["canonical_label"],
+        "Maritime corridor disruption updated"
+    );
+    assert_eq!(update_json["event_node"]["uncertainty_state"], "unknown");
+    assert_eq!(
+        update_json["event_node"]["corpus_ref"],
+        "https://echo.moonwitness.org/radar/evt-radar-001"
+    );
+
+    // Verify persistence via GET /api/nodes/{node_id}
+    let (get_status, get_json) = send_json_request(
+        &router,
+        Method::GET,
+        "/api/nodes/radar-event-evt-radar-001",
+        None,
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(
+        get_json["canonical_label"],
+        "Maritime corridor disruption updated"
+    );
+    assert_eq!(get_json["metadata"]["mtime"]["religious_authority"], false);
+}

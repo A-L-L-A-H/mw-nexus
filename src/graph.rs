@@ -141,6 +141,34 @@ pub struct SubgraphResponse {
     pub boundary_notice: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RadarIngestRequest {
+    pub event_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub primary_domain: Option<String>,
+    #[serde(default)]
+    pub cluster_key: Option<String>,
+    #[serde(default)]
+    pub source_uri: Option<String>,
+    #[serde(default)]
+    pub occurred_at: Option<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RadarIngestResponse {
+    pub status: String,
+    pub event_node: OntologyNode,
+    pub correlation_edge: Option<OntologyEdge>,
+    pub linked_target_node_id: Option<String>,
+    pub uncertainty_state_preserved: bool,
+}
+
 /// Computes a canonical SHA-256 hex digest for evidence payloads.
 pub fn compute_evidence_hash(evidence_payload: &str) -> String {
     let mut hasher = Sha256::new();
@@ -683,6 +711,315 @@ impl NexusGraphStore {
             boundary_notice,
         })
     }
+
+    /// Ingests an `mw-echo` World Radar event into `ontology_nodes` as an `EVENT_LEGEND` node
+    /// (preserving `uncertainty_state` and immutable `corpus_ref` on updates) and links it
+    /// via a `RELATIONSHIP_CORRELATION` (`correlated_with`) edge to a matching domain/source node if present.
+    pub fn ingest_radar_event(
+        &self,
+        request: RadarIngestRequest,
+    ) -> Result<RadarIngestResponse, GraphError> {
+        let event_id = request.event_id.trim().to_owned();
+        if event_id.is_empty() {
+            return Err(GraphError::InvalidRequest {
+                reason: "eventId must not be empty".to_owned(),
+            });
+        }
+        let title = request.title.trim().to_owned();
+        if title.is_empty() {
+            return Err(GraphError::InvalidRequest {
+                reason: "title must not be empty".to_owned(),
+            });
+        }
+
+        let node_id = format!("radar-event-{event_id}");
+        let source_uri = request
+            .source_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let primary_domain = request
+            .primary_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let cluster_key = request
+            .cluster_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let occurred_at = request
+            .occurred_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let cleaned_domains = sanitize_alias_list(request.domains);
+        let mtime_snapshot = occurred_at
+            .as_deref()
+            .and_then(|ts| crate::mtime::convert_ts_param(Some(ts)).ok());
+
+        let metadata_value = serde_json::json!({
+            "ingested_from": "mw-echo-world-radar",
+            "event_id": event_id,
+            "summary": request.summary.trim(),
+            "primary_domain": primary_domain,
+            "cluster_key": cluster_key,
+            "source_uri": source_uri,
+            "occurred_at": occurred_at,
+            "domains": cleaned_domains,
+            "mtime": mtime_snapshot,
+        });
+        let metadata_json = serde_json::to_string(&metadata_value)?;
+
+        let guard = self.connection.lock().map_err(|_| GraphError::LockPoisoned)?;
+        let existing_node = guard
+            .query_row(
+                "SELECT id, domain, canonical_label, corpus_ref, uncertainty_state,
+                        alias_set_json, sensitivity_class, metadata_json, created_at
+                 FROM ontology_nodes
+                 WHERE id = ?1",
+                params![&node_id],
+                row_to_ontology_node,
+            )
+            .optional()?;
+
+        let (status, event_node) = if let Some(mut existing) = existing_node {
+            if existing.sensitivity_class == SensitivityClass::ChildSensitive {
+                return Err(GraphError::ChildSensitiveBlocked);
+            }
+
+            let mut updated_aliases = existing.alias_set.clone();
+            if let Some(ref key) = cluster_key {
+                updated_aliases.push(key.clone());
+            }
+            let deduped_aliases = sanitize_alias_list(updated_aliases);
+            let alias_set_json = serde_json::to_string(&deduped_aliases)?;
+
+            // Preserve uncertainty_state and immutable corpus_ref on update.
+            guard.execute(
+                "UPDATE ontology_nodes
+                 SET canonical_label = ?1, alias_set_json = ?2, metadata_json = ?3
+                 WHERE id = ?4",
+                params![&title, &alias_set_json, &metadata_json, &node_id],
+            )?;
+
+            existing.canonical_label = title;
+            existing.alias_set = deduped_aliases;
+            existing.alias_set_json = alias_set_json;
+            existing.metadata = metadata_value;
+            ("updated".to_owned(), existing)
+        } else {
+            let corpus_ref = source_uri
+                .clone()
+                .unwrap_or_else(|| format!("mw-echo://radar/{event_id}"));
+            let initial_aliases = cluster_key.clone().into_iter().collect::<Vec<_>>();
+            let cleaned_aliases = sanitize_alias_list(initial_aliases);
+            let alias_set_json = serde_json::to_string(&cleaned_aliases)?;
+            let created_at = Utc::now().to_rfc3339();
+            let uncertainty_state = UncertaintyState::Unknown;
+            let sensitivity_class = SensitivityClass::Internal;
+
+            guard.execute(
+                "INSERT INTO ontology_nodes (
+                    id, domain, canonical_label, corpus_ref, uncertainty_state,
+                    alias_set_json, sensitivity_class, metadata_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    &node_id,
+                    ProvenanceDomain::EventLegend.code(),
+                    &title,
+                    &corpus_ref,
+                    uncertainty_state.as_str(),
+                    &alias_set_json,
+                    sensitivity_class.as_str(),
+                    &metadata_json,
+                    &created_at
+                ],
+            )?;
+
+            (
+                "created".to_owned(),
+                OntologyNode {
+                    id: node_id.clone(),
+                    domain: ProvenanceDomain::EventLegend,
+                    canonical_label: title,
+                    corpus_ref,
+                    uncertainty_state,
+                    alias_set: cleaned_aliases,
+                    alias_set_json,
+                    sensitivity_class,
+                    metadata: metadata_value,
+                    created_at,
+                },
+            )
+        };
+
+        let target_node = find_radar_correlation_target(
+            &guard,
+            &event_node.id,
+            source_uri.as_deref(),
+            primary_domain.as_deref(),
+            &cleaned_domains,
+        )?;
+
+        let (correlation_edge, linked_target_node_id) = if let Some(target) = target_node {
+            let existing_edge = guard
+                .query_row(
+                    "SELECT id, source_node_id, target_node_id, source_domain, target_domain,
+                            relation_kind, evidence_hash, evidence_locator, review_state,
+                            uncertainty_note, created_at
+                     FROM ontology_edges
+                     WHERE source_node_id = ?1
+                       AND target_node_id = ?2
+                       AND relation_kind = ?3
+                     LIMIT 1",
+                    params![
+                        &event_node.id,
+                        &target.id,
+                        RelationKind::CorrelatedWith.as_str()
+                    ],
+                    row_to_ontology_edge,
+                )
+                .optional()?;
+
+            let edge = if let Some(edge) = existing_edge {
+                edge
+            } else {
+                let evidence_hash = compute_evidence_hash(&format!(
+                    "{}|{}|{}",
+                    event_node.id, target.id, event_node.corpus_ref
+                ));
+                let validated_boundary = validate_cross_domain_boundary(
+                    &event_node.id,
+                    &target.id,
+                    event_node.domain,
+                    target.domain,
+                    RelationKind::CorrelatedWith.as_str(),
+                    &evidence_hash,
+                )?;
+                let edge_id = Uuid::new_v4().to_string();
+                let created_at = Utc::now().to_rfc3339();
+                let evidence_locator = event_node.corpus_ref.clone();
+                let review_state = ReviewState::Candidate;
+                let uncertainty_note =
+                    "Automated World Radar correlation; non-causal and pending human review."
+                        .to_owned();
+
+                guard.execute(
+                    "INSERT INTO ontology_edges (
+                        id, source_node_id, target_node_id, source_domain, target_domain,
+                        relation_kind, evidence_hash, evidence_locator, review_state,
+                        uncertainty_note, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        &edge_id,
+                        &event_node.id,
+                        &target.id,
+                        event_node.domain.code(),
+                        target.domain.code(),
+                        validated_boundary.relation_kind.as_str(),
+                        &evidence_hash,
+                        &evidence_locator,
+                        review_state.as_str(),
+                        &uncertainty_note,
+                        &created_at
+                    ],
+                )?;
+
+                OntologyEdge {
+                    id: edge_id,
+                    source_node_id: event_node.id.clone(),
+                    target_node_id: target.id.clone(),
+                    source_domain: event_node.domain,
+                    target_domain: target.domain,
+                    relation_kind: validated_boundary.relation_kind,
+                    evidence_hash,
+                    evidence_locator,
+                    review_state,
+                    uncertainty_note,
+                    implies_causation: validated_boundary.implies_causation,
+                    implies_identity: validated_boundary.implies_identity,
+                    created_at,
+                }
+            };
+
+            let target_id = target.id;
+            (Some(edge), Some(target_id))
+        } else {
+            (None, None)
+        };
+
+        Ok(RadarIngestResponse {
+            status,
+            event_node,
+            correlation_edge,
+            linked_target_node_id,
+            uncertainty_state_preserved: true,
+        })
+    }
+}
+
+fn find_radar_correlation_target(
+    conn: &Connection,
+    event_node_id: &str,
+    source_uri: Option<&str>,
+    primary_domain: Option<&str>,
+    domains: &[String],
+) -> Result<Option<OntologyNode>, GraphError> {
+    if let Some(uri) = source_uri {
+        let matched = conn
+            .query_row(
+                "SELECT id, domain, canonical_label, corpus_ref, uncertainty_state,
+                        alias_set_json, sensitivity_class, metadata_json, created_at
+                 FROM ontology_nodes
+                 WHERE id != ?1
+                   AND sensitivity_class != 'CHILD_SENSITIVE'
+                   AND (id = ?2 OR corpus_ref = ?2)
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 1",
+                params![event_node_id, uri],
+                row_to_ontology_node,
+            )
+            .optional()?;
+        if matched.is_some() {
+            return Ok(matched);
+        }
+    }
+
+    let mut domain_candidates = Vec::new();
+    if let Some(primary) = primary_domain {
+        domain_candidates.push(primary);
+    }
+    for domain in domains {
+        domain_candidates.push(domain.as_str());
+    }
+
+    for candidate in domain_candidates {
+        let normalized_upper = candidate.to_ascii_uppercase();
+        let matched = conn
+            .query_row(
+                "SELECT id, domain, canonical_label, corpus_ref, uncertainty_state,
+                        alias_set_json, sensitivity_class, metadata_json, created_at
+                 FROM ontology_nodes
+                 WHERE id != ?1
+                   AND sensitivity_class != 'CHILD_SENSITIVE'
+                   AND (id = ?2 OR domain = ?3 OR LOWER(canonical_label) = LOWER(?2))
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 1",
+                params![event_node_id, candidate, normalized_upper],
+                row_to_ontology_node,
+            )
+            .optional()?;
+        if matched.is_some() {
+            return Ok(matched);
+        }
+    }
+
+    Ok(None)
 }
 
 fn sanitize_alias_list(raw_aliases: Vec<String>) -> Vec<String> {

@@ -1,5 +1,6 @@
 use mw_nexus::api::{AppState, build_router};
 use mw_nexus::graph::NexusGraphStore;
+use mw_nexus::mtime::MTIME_PROFILE;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         address = %bind_addr,
         database = %db_path.display(),
         journal_mode = %journal_mode,
+        mtime_profile = %MTIME_PROFILE,
         "mw-nexus server started"
     );
 

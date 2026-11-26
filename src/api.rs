@@ -5,19 +5,21 @@ use crate::crayon::{
 use crate::domains::{DomainMetadata, canonical_domains, permitted_relation_kinds};
 use crate::graph::{
     CorrelationListFilter, CreateCorrelationRequest, CreateNodeRequest, GraphError,
-    NexusGraphStore, NodeListFilter, OntologyEdge, OntologyNode, SubgraphQuery, SubgraphResponse,
+    NexusGraphStore, NodeListFilter, OntologyEdge, OntologyNode, RadarIngestRequest,
+    RadarIngestResponse, SubgraphQuery, SubgraphResponse,
 };
 use crate::mizan::{
     ADR_REFERENCE, MizanDiagnostic, MizanEvaluationRequest, MizanRejection, POLICY_VERSION,
     evaluate_mizan,
 };
+use crate::mtime::{MTIME_PROFILE, MTimeConversion, MTimeError, convert_ts_param};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -158,6 +160,22 @@ impl From<MizanRejection> for ApiError {
     }
 }
 
+impl From<MTimeError> for ApiError {
+    fn from(err: MTimeError) -> Self {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TIMESTAMP",
+            err.to_string(),
+            MTIME_PROFILE,
+        )
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TimeConvertQuery {
+    pub ts: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
@@ -204,6 +222,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/mizan/evaluate", post(evaluate_mizan_handler))
         .route("/api/profiles/crayon", get(crayon_profile_handler))
         .route("/api/profiles/rgbl", get(rgbl_profile_handler))
+        .route("/api/time/convert", get(time_convert_handler))
+        .route("/api/radar/ingest", post(radar_ingest_handler))
         .with_state(state)
 }
 
@@ -298,4 +318,24 @@ async fn crayon_profile_handler(State(state): State<AppState>) -> Json<CrayonInq
 
 async fn rgbl_profile_handler(State(state): State<AppState>) -> Json<OmniscienceRgblProfile> {
     Json(state.rgbl_profile.clone())
+}
+
+async fn time_convert_handler(
+    Query(query): Query<TimeConvertQuery>,
+) -> Result<Json<MTimeConversion>, ApiError> {
+    let conversion = convert_ts_param(query.ts.as_deref())?;
+    Ok(Json(conversion))
+}
+
+async fn radar_ingest_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<RadarIngestRequest>,
+) -> Result<(StatusCode, Json<RadarIngestResponse>), ApiError> {
+    let response = state.store.ingest_radar_event(payload)?;
+    let status_code = if response.status == "created" {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status_code, Json(response)))
 }
