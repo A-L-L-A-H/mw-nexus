@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*

@@ -1,0 +1,33 @@
+[package]
+name = "mw-nexus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "MoonWitness 7-Domain Provenance Ontology, Correlation Graph & Non-Normative Mizan/CRAYON Engine"
+license = "AGPL-3.0-only"
+repository = "https://github.com/A-L-L-A-H/mw-nexus"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
