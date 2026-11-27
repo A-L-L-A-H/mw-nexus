@@ -13,6 +13,13 @@ use crate::mizan::{
     evaluate_mizan,
 };
 use crate::mtime::{MTIME_PROFILE, MTimeConversion, MTimeError, convert_ts_param};
+use crate::corpus_sync::{
+    CorpusSyncError, CorpusSyncRequest, CorpusSyncResponse, sync_from_corpus_server,
+};
+use crate::verify_claim::{
+    MizanScoreQuery, MizanScoreSummaryResponse, VerifyClaimRequest, VerifyClaimResponse,
+    compute_mizan_score_summary, verify_claim,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -171,6 +178,20 @@ impl From<MTimeError> for ApiError {
     }
 }
 
+impl From<CorpusSyncError> for ApiError {
+    fn from(err: CorpusSyncError) -> Self {
+        match err {
+            CorpusSyncError::Graph(graph_err) => ApiError::from(graph_err),
+            other => ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "CORPUS_SYNC_ERROR",
+                other.to_string(),
+                "mw-corpus-bridge-v1",
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct TimeConvertQuery {
     pub ts: Option<String>,
@@ -224,6 +245,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/profiles/rgbl", get(rgbl_profile_handler))
         .route("/api/time/convert", get(time_convert_handler))
         .route("/api/radar/ingest", post(radar_ingest_handler))
+        .route("/api/nexus/verify-claim", post(verify_claim_handler))
+        .route("/api/nexus/mizan/score", get(mizan_score_handler))
+        .route("/api/nexus/corpus/sync", post(corpus_sync_handler))
         .with_state(state)
 }
 
@@ -338,4 +362,106 @@ async fn radar_ingest_handler(
         StatusCode::OK
     };
     Ok((status_code, Json(response)))
+}
+
+async fn verify_claim_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<VerifyClaimRequest>,
+) -> Result<Json<VerifyClaimResponse>, ApiError> {
+    let outcome = verify_claim(&state.store, &payload)?;
+    Ok(Json(outcome))
+}
+
+async fn mizan_score_handler(
+    State(state): State<AppState>,
+    Query(query): Query<MizanScoreQuery>,
+) -> Result<Json<MizanScoreSummaryResponse>, ApiError> {
+    let summary = compute_mizan_score_summary(&state.store, &query)?;
+    Ok(Json(summary))
+}
+
+async fn corpus_sync_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<CorpusSyncRequest>,
+) -> Result<Json<CorpusSyncResponse>, ApiError> {
+    let outcome = sync_from_corpus_server(&state.store, payload).await?;
+    Ok(Json(outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domains::{ProvenanceDomain, UncertaintyState};
+    use crate::graph::CreateNodeRequest;
+    use crate::mizan::{MizanStatus, SensitivityClass};
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn serves_verify_claim_and_mizan_score_http_routes() {
+        let store = NexusGraphStore::open_in_memory().expect("in-memory store");
+        store
+            .create_node(CreateNodeRequest {
+                id: Some("node-test-corpus".to_owned()),
+                domain: ProvenanceDomain::TextRgbl,
+                canonical_label: "Genesis 1:1 WEBP".to_owned(),
+                corpus_ref: "mw-corpus:sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned(),
+                uncertainty_state: Some(UncertaintyState::HumanReviewed),
+                alias_set: Some(vec!["Genesis 1:1".to_owned()]),
+                sensitivity_class: Some(SensitivityClass::Internal),
+                metadata: None,
+            })
+            .expect("create node");
+
+        let router = build_router(AppState::new(store));
+
+        let verify_req = Request::builder()
+            .method("POST")
+            .uri("/api/nexus/verify-claim")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "claim_id": "claim-http-1",
+                    "claim_text": "Witness passage Genesis 1:1 is anchored in TEXT_RGBL.",
+                    "corpus_refs": ["mw-corpus:sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"]
+                })
+                .to_string(),
+            ))
+            .expect("build verify request");
+
+        let verify_res = router.clone().oneshot(verify_req).await.expect("oneshot verify");
+        assert_eq!(verify_res.status(), StatusCode::OK);
+        let verify_bytes = verify_res
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let verify_body: VerifyClaimResponse =
+            serde_json::from_slice(&verify_bytes).expect("parse verify response");
+        assert_eq!(verify_body.status, MizanStatus::AdvisoryNonNormative);
+        assert_eq!(verify_body.matched_node_ids, vec!["node-test-corpus"]);
+
+        let score_req = Request::builder()
+            .method("GET")
+            .uri("/api/nexus/mizan/score?node_id=node-test-corpus")
+            .body(Body::empty())
+            .expect("build score request");
+        let score_res = router.oneshot(score_req).await.expect("oneshot score");
+        assert_eq!(score_res.status(), StatusCode::OK);
+        let score_bytes = score_res
+            .into_body()
+            .collect()
+            .await
+            .expect("collect score body")
+            .to_bytes();
+        let score_body: MizanScoreSummaryResponse =
+            serde_json::from_slice(&score_bytes).expect("parse score response");
+        assert_eq!(score_body.status, MizanStatus::AdvisoryNonNormative);
+        assert_eq!(score_body.advisory_score, Some(1.0));
+        assert!(score_body.advisory_only);
+        assert!(!score_body.normative_verdicts_allowed);
+    }
 }
