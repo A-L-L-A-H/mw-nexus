@@ -280,6 +280,10 @@ fn scan_for_prohibited_text(field_name: &str, text: &str) -> Result<(), MizanRej
 /// - Rejects unverified legacy dev-mw-blueprint TH/ARI schemas.
 /// - Preserves Unknown-Stays-Unknown: missing, unreviewed, or conflicting evidence emits
 ///   `unknown` or `insufficient_evidence` with `advisory_score: None` (NEVER coerced to 0.0 or safe).
+pub fn validate_mizan_text_boundary(field_name: &str, text: &str) -> Result<(), MizanRejection> {
+    scan_for_prohibited_text(field_name, text)
+}
+
 pub fn evaluate_mizan(request: &MizanEvaluationRequest) -> Result<MizanDiagnostic, MizanRejection> {
     // Gate 1 (FM-04): Fail-closed block on CHILD_SENSITIVE or minor involvement.
     if request.sensitivity_class == SensitivityClass::ChildSensitive

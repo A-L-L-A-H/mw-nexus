@@ -4,5 +4,6 @@ pub mod crayon;
 pub mod domains;
 pub mod graph;
 pub mod mizan;
+pub mod mizan_search;
 pub mod mtime;
 pub mod verify_claim;
