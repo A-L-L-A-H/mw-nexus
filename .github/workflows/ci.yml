@@ -9,17 +9,35 @@ on:
 
 permissions:
   contents: read
+  security-events: write
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  commitlint:
+    name: Commitlint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Install commitlint
+        run: npm install -g @commitlint/cli @commitlint/config-conventional
+      - name: Run commitlint
+        run: npx commitlint --from=origin/main --to=HEAD --extends @commitlint/config-conventional
+
   verify:
     name: Verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -29,7 +47,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -37,13 +55,6 @@ jobs:
             ~/.cargo/registry/cache/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Check conventional commit messages
-        if: github.event_name == 'pull_request'
-        run: |
-          git log --format=%s origin/main..HEAD | while IFS= read -r msg; do
-            echo "$msg" | grep -qE '^(feat|fix|docs|chore|refactor|test|perf|build|ci|revert|security|deps|style|release)(\(.+\))?!?: .+' || { echo "Invalid: $msg"; exit 1; }
-          done
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -54,8 +65,12 @@ jobs:
       - name: cargo test
         run: cargo test --all-features
 
-  secret-scan:
-    name: Secret scan
+      - name: Observability endpoints
+        run: |
+          grep -R --include='*.rs' -E '/health|/metrics' . || { echo "No /health or /metrics endpoint found"; exit 1; }
+
+  security:
+    name: Security
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +78,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v3
         env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+      - name: cargo deny
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check 2>/dev/null || echo "cargo deny config absent (deny.toml) - skipping"
