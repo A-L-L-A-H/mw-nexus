@@ -12,6 +12,9 @@ use crate::mizan::{
     ADR_REFERENCE, MizanDiagnostic, MizanEvaluationRequest, MizanRejection, POLICY_VERSION,
     evaluate_mizan,
 };
+use crate::mizan_search::{
+    MizanHybridSearchRequest, MizanHybridSearchResponse, execute_mizan_hybrid_search,
+};
 use crate::mtime::{MTIME_PROFILE, MTimeConversion, MTimeError, convert_ts_param};
 use crate::corpus_sync::{
     CorpusSyncError, CorpusSyncRequest, CorpusSyncResponse, sync_from_corpus_server,
@@ -241,6 +244,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/graph", get(query_graph_handler))
         .route("/api/mizan/evaluate", post(evaluate_mizan_handler))
+        .route("/api/mizan/search", post(mizan_search_handler))
         .route("/api/profiles/crayon", get(crayon_profile_handler))
         .route("/api/profiles/rgbl", get(rgbl_profile_handler))
         .route("/api/time/convert", get(time_convert_handler))
@@ -334,6 +338,14 @@ async fn evaluate_mizan_handler(
 ) -> Result<Json<MizanDiagnostic>, ApiError> {
     let diagnostic = evaluate_mizan(&payload)?;
     Ok(Json(diagnostic))
+}
+
+async fn mizan_search_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<MizanHybridSearchRequest>,
+) -> Result<Json<MizanHybridSearchResponse>, ApiError> {
+    let outcome = execute_mizan_hybrid_search(&state.store, &payload)?;
+    Ok(Json(outcome))
 }
 
 async fn crayon_profile_handler(State(state): State<AppState>) -> Json<CrayonInquiryProfile> {
@@ -449,7 +461,7 @@ mod tests {
             .uri("/api/nexus/mizan/score?node_id=node-test-corpus")
             .body(Body::empty())
             .expect("build score request");
-        let score_res = router.oneshot(score_req).await.expect("oneshot score");
+        let score_res = router.clone().oneshot(score_req).await.expect("oneshot score");
         assert_eq!(score_res.status(), StatusCode::OK);
         let score_bytes = score_res
             .into_body()
@@ -463,5 +475,34 @@ mod tests {
         assert_eq!(score_body.advisory_score, Some(1.0));
         assert!(score_body.advisory_only);
         assert!(!score_body.normative_verdicts_allowed);
+
+        let search_req = Request::builder()
+            .method("POST")
+            .uri("/api/mizan/search")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "query": "Genesis 1:1 WEBP",
+                    "top_k": 5,
+                    "bm25_weight": 0.5,
+                    "vector_weight": 0.5
+                })
+                .to_string(),
+            ))
+            .expect("build search request");
+        let search_res = router.oneshot(search_req).await.expect("oneshot search");
+        assert_eq!(search_res.status(), StatusCode::OK);
+        let search_bytes = search_res
+            .into_body()
+            .collect()
+            .await
+            .expect("collect search body")
+            .to_bytes();
+        let search_body: MizanHybridSearchResponse =
+            serde_json::from_slice(&search_bytes).expect("parse search response");
+        assert_eq!(search_body.results.len(), 1);
+        assert_eq!(search_body.results[0].id, "node-test-corpus");
+        assert!(search_body.results[0].hybrid_score > 0.0);
+        assert!(search_body.advisory_only);
     }
 }
